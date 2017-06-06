@@ -24,7 +24,7 @@ setup(
     ext_modules = ext_modules,
     include_dirs = [np.get_include()],
     zip_safe=False,
-    packages = ['cupcake', 'cupcake.io', 'cupcake.ice', 'cupcake.tofu', 'cupcake.tofu.branch']
+    packages = ['cupcake', 'cupcake.io', 'cupcake.ice', 'cupcake.tofu', 'cupcake.tofu.counting', 'cupcake.tofu.branch'],
     install_requires=[
         'biopython',
         'bx-python'
