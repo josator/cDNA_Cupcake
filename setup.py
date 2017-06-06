@@ -35,6 +35,7 @@ setup(
                'cupcake/tofu/filter_by_count.py',
                'cupcake/tofu/filter_away_subset.py',
                'cupcake/tofu/process_blasr_to_read_stat.py',
-               'cupcake/tofu/fusion_finder.py'
+               'cupcake/tofu/fusion_finder.py',
+               'cupcake/tofu/counting/chain_samples.py'
                ],
     )
