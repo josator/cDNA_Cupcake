@@ -86,7 +86,7 @@ def pick_rep(fa_fq_filename, gff_filename, group_filename, output_filename, is_f
     fout.close()
 
 
-def collapse_fuzzy_junctions(gff_filename, group_filename, allow_extra_5exon, internal_fuzzy_max_dist):
+def collapse_fuzzy_junctions(gff_filename, group_filename, fsm_maps, allow_extra_5exon, internal_fuzzy_max_dist):
     def get_fl_from_id(members):
         # ex: 13cycle_1Mag1Diff|i0HQ_SIRV_1d1m|c139597/f1p0/178
         return sum(int(_id.split('/')[1].split('p')[0][1:]) for _id in members)
@@ -112,29 +112,43 @@ def collapse_fuzzy_junctions(gff_filename, group_filename, allow_extra_5exon, in
                     r1.ref_exons[n2-1].start <= r2.ref_exons[-1].end < r1.ref_exons[n2].end
         return False
 
+    group_info = {}
+    with open(group_filename) as f:
+        for line in f:
+            pbid, members = line.strip().split('\t')
+            group_info[pbid] = [x for x in members.split(',')]
+
     d = {}
     recs = defaultdict(lambda: {'+':IntervalTree(), '-':IntervalTree()}) # chr --> strand --> tree
-    fuzzy_match = defaultdict(lambda: [])
+    fuzzy_match2 = defaultdict(lambda: [])
     for r in GFF.collapseGFFReader(gff_filename):
         d[r.seqid] = r
         has_match = False
         r.segments = r.ref_exons
         for r2 in recs[r.chr][r.strand].find(r.start, r.end):
             r2.segments = r2.ref_exons
-            m = compare_junctions.compare_junctions(r, r2, internal_fuzzy_max_dist=internal_fuzzy_max_dist)
+            m = compare_junctions.compare_junctions(r, r2, group_info, fsm_maps, args.collapse_3_distance, args.collapse_5_distance, internal_fuzzy_max_dist=internal_fuzzy_max_dist)
             if can_merge(m, r, r2):
-                fuzzy_match[r2.seqid].append(r.seqid)
-                has_match = True
-                break
+                fm_merge=True
+                for (fm_id, fm_r) in fuzzy_match2[r2.seqid]:
+                    if fm_id == r2.seqid:
+                        continue
+                    else:
+                        m2 = compare_junctions.compare_junctions(r, fm_r, group_info, fsm_maps, args.collapse_3_distance, args.collapse_5_distance, internal_fuzzy_max_dist=internal_fuzzy_max_dist)
+                        if not can_merge(m2, r, fm_r):
+                            fm_merge = False
+                            break
+                if fm_merge:
+                    fuzzy_match2[r2.seqid].append((r.seqid,r))
+                    has_match = True
+                    break
         if not has_match:
             recs[r.chr][r.strand].insert(r.start, r.end, r)
-            fuzzy_match[r.seqid] = [r.seqid]
+            fuzzy_match2[r.seqid] = [(r.seqid, r)]
 
-    group_info = {}
-    with open(group_filename) as f:
-        for line in f:
-            pbid, members = line.strip().split('\t')
-            group_info[pbid] = [x for x in members.split(',')]
+    fuzzy_match = defaultdict(lambda: [])
+    for fm2_key, fm2_value in fuzzy_match2.iteritems():
+        fuzzy_match[fm2_key] = [ x[0] for x in fm2_value ]
 
     # pick for each fuzzy group the one that has the most exons (if tie, then most FL)
     keys = fuzzy_match.keys()
@@ -170,6 +184,18 @@ def main(args):
         print >> sys.stderr, "SAM file {0} does not exist. Abort.".format(args.sam)
         sys.exit(-1)
 
+    if not os.path.exists( args.sqanti ):
+        print >> sys.stderr, "SQANTI report file {0} does not exist. Abort.".format( args.sqanti )
+        sys.exit(-1)
+
+    # Load FSM info from SQANTI report
+    fsm_maps = defaultdict(lambda: None)
+    for line in open( args.sqanti ):
+        columns = line.split()
+        
+        if ( columns[5] == "full-splice_match" ):
+            fsm_maps[columns[0]] = columns[7]
+
     # check for duplicate IDs
     check_ids_unique(args.input, is_fq=args.fq)
 
@@ -184,12 +210,12 @@ def main(args):
         f_bad = f_good
         cov_threshold = 1
     f_txt = open(args.prefix + '.collapsed.group.txt', 'w')
-
-    b = branch_simple2.BranchSimple(args.input, cov_threshold=cov_threshold, min_aln_coverage=args.min_aln_coverage, min_aln_identity=args.min_aln_identity, is_fq=args.fq)
+    
+    b = branch_simple2.BranchSimple(args.input, fsm_maps, cov_threshold=cov_threshold, min_aln_coverage=args.min_aln_coverage, min_aln_identity=args.min_aln_identity, is_fq=args.fq)
     iter = b.iter_gmap_sam(args.sam, ignored_fout)
     for recs in iter:
         for v in recs.itervalues():
-            if len(v) > 0: b.process_records(v, args.allow_extra_5exon, False, f_good, f_bad, f_txt)
+            if len(v) > 0: b.process_records(v, args.allow_extra_5exon, False, f_good, f_bad, f_txt, collapse_3_distance = args.collapse_3_distance, collapse_5_distance = args.collapse_5_distance)
 
     ignored_fout.close()
     f_good.close()
@@ -200,7 +226,7 @@ def main(args):
     f_txt.close()
 
     if args.max_fuzzy_junction > 0: # need to further collapse those that have fuzzy junctions!
-        collapse_fuzzy_junctions(f_good.name, f_txt.name, args.allow_extra_5exon, internal_fuzzy_max_dist=args.max_fuzzy_junction)
+        collapse_fuzzy_junctions(f_good.name, f_txt.name, fsm_maps, args.allow_extra_5exon, internal_fuzzy_max_dist=args.max_fuzzy_junction)
         os.rename(f_good.name, f_good.name+'.unfuzzy')
         os.rename(f_txt.name, f_txt.name+'.unfuzzy')
         os.rename(f_good.name+'.fuzzy', f_good.name)
@@ -230,15 +256,17 @@ if __name__ == "__main__":
     parser.add_argument("--input", help="Input FA/FQ filename")
     parser.add_argument("--fq", default=False, action="store_true", help="Input is a fastq file (default is fasta)")
     parser.add_argument("-s", "--sam", required=True, help="Sorted GMAP SAM filename")
+    parser.add_argument("--sqanti", required=True, help="SQANTI report file")
     parser.add_argument("-o", "--prefix", required=True, help="Output filename prefix")
     parser.add_argument("-c", "--min-coverage", dest="min_aln_coverage", type=float, default=.99, help="Minimum alignment coverage (default: 0.99)")
     parser.add_argument("-i", "--min-identity", dest="min_aln_identity", type=float, default=.95, help="Minimum alignment identity (default: 0.95)")
     parser.add_argument("--max_fuzzy_junction", default=5, type=int, help="Max fuzzy junction dist (default: 5 bp)")
     parser.add_argument("--flnc_coverage", dest="flnc_coverage", type=int, default=-1, help="Minimum # of FLNC reads, only use this for aligned FLNC reads, otherwise results undefined!")
     parser.add_argument("--dun-merge-5-shorter", action="store_false", dest="allow_extra_5exon", default=True, help="Don't collapse shorter 5' transcripts (default: turned off)")
-
+    parser.add_argument("--collapse-3-distance", default=50, dest="collapse_3_distance", type=int, help="Don't collapse 3' transcripts if exon distance is smaller (default: 50)")
+    parser.add_argument("--collapse-5-distance", default=50, dest="collapse_5_distance", type=int, help="Don't collapse 5' transcripts if exon distance is smaller (default: 50)")
+ 
     args = parser.parse_args()
 
     main(args)
-
 

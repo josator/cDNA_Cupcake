@@ -1,4 +1,4 @@
-import os, sys
+import os, sys, json, re
 import numpy as np
 
 import cupcake.io.BioReaders as BioReaders
@@ -25,7 +25,7 @@ class BranchSimple:
     BranchSimple is designed for just creating exons from PacBio's GMAP results
     Does not use Illumina
     """
-    def __init__(self, transfrag_filename, cov_threshold=2, min_aln_coverage=.99, min_aln_identity=.85, is_fq=False):
+    def __init__(self, transfrag_filename, fsm_maps, cov_threshold=2, min_aln_coverage=.99, min_aln_identity=.85, is_fq=False):
         self.contiVec = None # current ContiVec object
         self.exons = None
         #self.MIN_EXON_SIZE = max_fuzzy_junction
@@ -33,13 +33,14 @@ class BranchSimple:
         self.transfrag_filename = transfrag_filename
         self.transfrag_len_dict = dict((r.id.split()[0], len(r.seq)) for r in SeqIO.parse(open(transfrag_filename), 'fastq' if is_fq else 'fasta'))
 
+        self.fsm_maps = fsm_maps
+
         self.cov_threshold = cov_threshold # only output GTF records if >= this many GMAP records support it (this must be if I'm running non-clustered fasta on GMAP)
 
         self.min_aln_coverage = min_aln_coverage
         self.min_aln_identity = min_aln_identity
 
         self.cuff_index = 1
-
 
     def iter_gmap_sam(self, gmap_sam_filename, ignored_fout):
         """
@@ -58,7 +59,7 @@ class BranchSimple:
             if r.sID == '*':
                 ignored_fout.write("{0}\tUnmapped.\n".format(r.qID))
             elif r.qCoverage < self.min_aln_coverage:
-                ignored_fout.write("{0}\tCoverage {1:.3f} too low.\n".format(r.qID, r.qCoverage))
+                ignored_fout.write("{0}\tCoverage {1:.3f} too low.\n".format(r.qID, r.qCoverage or 0))
             elif r.identity < self.min_aln_identity:
                 ignored_fout.write("{0}\tIdentity {1:.3f} too low.\n".format(r.qID, r.identity))
             else:
@@ -73,7 +74,7 @@ class BranchSimple:
                 print >> sys.stderr, "SAM file is NOT sorted. ABORT!"
                 sys.exit(-1)
             if r.qCoverage < self.min_aln_coverage:
-                ignored_fout.write("{0}\tCoverage {1:.3f} too low.\n".format(r.qID, r.qCoverage))
+                ignored_fout.write("{0}\tCoverage {1:.3f} too low.\n".format(r.qID, r.qCoverage or 0))
             elif r.identity < self.min_aln_identity:
                 ignored_fout.write("{0}\tIdentity {1:.3f} too low.\n".format(r.qID, r.identity))
             elif r.sID != records[0].sID or r.sStart > max(x.sEnd for x in records):
@@ -230,7 +231,7 @@ class BranchSimple:
     #         else:
     #             i += 1 # nothing to do, advance
 
-    def process_records(self, records, allow_extra_5_exons, skip_5_exon_alt, f_good, f_bad, f_group, tolerate_end=100, starting_isoform_index=0, gene_prefix='PB'):
+    def process_records(self, records, allow_extra_5_exons, skip_5_exon_alt, f_good, f_bad, f_group, tolerate_end=100, starting_isoform_index=0, gene_prefix='PB', collapse_3_distance=50, collapse_5_distance=50):
         """
         Given a set of records
         (1) process them by running through parse_transfrag2contig
@@ -254,18 +255,18 @@ class BranchSimple:
             stuff = self.match_record(r, tolerate_end=tolerate_end)#, tolerate_middle=self.MIN_EXON_SIZE)
             m = np.zeros((1, mat_size), dtype=np.int)
             for x in stuff: m[0, x.value]=1
-            result.append((r.qID, r.flag.strand, m))
+            result.append((r.qID, r.flag.strand, m, self.fsm_maps[r.qID]))
 
         result_merged = list(result)
-        iterative_merge_transcripts(result_merged, node_d, allow_extra_5_exons)
-
+        result_merged = iterative_merge_transcripts(self, list(result), node_d, collapse_3_distance, collapse_5_distance, allow_extra_5_exons )
+ 
         print >> sys.stderr, "merged {0} down to {1} transcripts".format(len(result), len(result_merged))
 
         self.isoform_index = starting_isoform_index
         # make the exon value --> interval dictionary
         a = []
 
-        for ids, strand, m in result_merged:
+        for ids, strand, m, fsm in result_merged:
             assert self.strand==strand
             if ids.count(',')+1 < self.cov_threshold:
                 f_out = f_bad
@@ -291,31 +292,39 @@ class BranchSimple:
 
         return result, result_merged
 
-def iterative_merge_transcripts(result_list, node_d, merge5=True):
+def iterative_merge_transcripts(self, result_list, node_d, collapse_3_distance, collapse_5_distance, merge5 = True):
     """
     result_list --- list of (qID, strand, binary exon sparse matrix)
     """
-    # sort by strand then starting position
-    result_list.sort(key=lambda x: (x[1], x[2].nonzero()[1][0]))
+
+    # sort by starting/ending position in ascending/descending order depending on 3' location (+/-)
+    result_list_plus = [ x for x in result_list if x[1] == '+' ]
+    result_list_plus.sort(key=lambda x: (x[1], x[2].nonzero()[1][-1]), reverse=True)
+    result_list_minus = [ x for x in result_list if x[1] == '-' ]
+    result_list_minus.sort(key=lambda x: (x[1], x[2].nonzero()[1][0]))
+
+    result_list = result_list_plus + result_list_minus
+
     i = 0
     while i < len(result_list) - 1:
         j = i + 1
         while j < len(result_list):
-            id1, strand1, m1 = result_list[i]
-            id2, strand2, m2 = result_list[j]
+            id1, strand1, m1, fsm1 = result_list[i]
+            id2, strand2, m2, fsm2 = result_list[j]
             if (strand1 != strand2) or (m1.nonzero()[1][-1] < m2.nonzero()[1][0]):
                 break
             else:
-                flag, m3 = compare_exon_matrix(m1, m2, node_d, strand1, merge5)
+                flag, m3, fsm3 = compare_exon_matrix(self, m1, m2, id1, id2, fsm1, fsm2, node_d, strand1, collapse_3_distance, collapse_5_distance, merge5)
                 if flag:
-                    result_list[i] = (id1+','+id2, strand1, m3)
+                    result_list[i] = (id1+','+id2, strand1, m3, fsm3)
                     result_list.pop(j)
                 else:
                     j += 1
         i += 1
 
-        
-def compare_exon_matrix(m1, m2, node_d, strand, merge5=True):
+    return result_list
+
+def compare_exon_matrix(self, m1, m2, id1, id2, fsm1, fsm2, node_d, strand, collapse_3_distance, collapse_5_distance, merge5=True):
     """
     m1, m2 are 1-d array where m1[0, i] is 1 if it uses the i-th exon, otherwise 0
     compare the two and merge them if they are compatible
@@ -325,17 +334,54 @@ def compare_exon_matrix(m1, m2, node_d, strand, merge5=True):
               if False, then m1 and m2 must have the same first (5') exon and only allowed
                         if the difference is the very start
 
-    return {True|False}, {merged array|None}
+    return {True|False}, {merged array|None}, {FSM|None}
     """
+
+    if fsm1 != None and fsm2 != None and fsm1 != fsm2:
+        return False, None, None
+
     l1 = m1.nonzero()[1]
     l2 = m2.nonzero()[1]
 
-
     # let l1 be the one that has the earliest start
-    if l2[0] < l1[0]: l1, l2 = l2, l1
+    if l2[0] < l1[0]:
+        l1, l2 = l2, l1
+        id1, id2 = id2, id1
+        m1, m2 = m2, m1
+        fsm1, fsm2 = fsm2, fsm1
+
+    # extract full-length group information
+    g1, fl1, mfl1 = 0, 0, -1
+    for group in id1.split(","):
+        aux1 = int( re.search( 'f.*p', group ).group(0)[1:-1] )
+        #aux1 = int( re.search( 'f.*p', group.split( "|", 1 )[1] ).group(0)[1:-1] )
+        if aux1 > mfl1:
+            mfl1 = aux1
+        fl1 += aux1
+        g1 += 1
+    
+    #print( "Merged: " + str( g1 ) + ", total full-length: " + str( fl1 ) + ", longest full-length: " + str( mfl1 ) )
+
+    g2, fl2, mfl2 = 0, 0, -1
+    for group in id2.split(","):
+        aux2 = int( re.search( 'f.*p', group ).group(0)[1:-1] )
+        #aux2 = int( re.search( 'f.*p', group.split( "|", 1 )[1] ).group(0)[1:-1] )
+        if aux2 > mfl2:
+            mfl2 = aux2
+        fl2 += aux2
+        g2 += 1
+
+    #print( "Merged: " + str( g2 ) + ", total full-length: " + str( fl2 ) + ", longest full-length: " + str( mfl2 ) )
+
+    #Set minimum distance to avoid collapses in 5' and 3'
+    dist_l, dist_r = 0, 0
+    if strand == '+':
+        dist_l, dist_r = collapse_5_distance, collapse_3_distance
+    else:
+        dist_l, dist_r = collapse_3_distance, collapse_5_distance
 
     # does not intersect at all
-    if l1[-1] < l2[0]: return False, None
+    if l1[-1] < l2[0]: return False, None, None
 
     n1 = len(l1)
     n2 = len(l2)
@@ -343,33 +389,93 @@ def compare_exon_matrix(m1, m2, node_d, strand, merge5=True):
     #  not ok if this is at the 3' end and does not share the last exon; if 5' end, ok to miss exons as long as rest agrees
     for i in xrange(n1):
         if l1[i] == l2[0]: break
-        elif i > 0 and (strand=='-' and node_d[l1[i-1]].end!=node_d[l1[i]].start): return False, None # 3' end disagree
-        elif i > 0 and (strand=='+' and not merge5 and node_d[l1[i-1]].end!=node_d[l1[i]].start): return False, None # 5' end disagree, in other words m1 has an extra 5' exon that m2 does not have and merge5 is no allowed
+        elif i > 0 and (strand=='-' and node_d[l1[i-1]].end!=node_d[l1[i]].start):
+            return False, None, None # 3' end disagree
+        elif i > 0 and (strand=='+' and node_d[l1[i-1]].end!=node_d[l1[i]].start):
+            if not merge5 or fl2 > g2:
+                return False, None, None # 5' end disagree, in other words m1 has an extra 5' exon that m2 does not have and merge5 is no allowed
+
+    if abs( node_d[l1[0]].start - node_d[l2[0]].start ) > dist_l:
+        if node_d[l1[0]].start < node_d[l2[0]].start and fl2 > g2: 
+            return False, None, None
+        if node_d[l1[0]].start > node_d[l2[0]].start and fl1 > g1:
+            return False, None, None
+
     # at this point: l1[i] == l2[0]
+
+    if strand == '+' and mfl1 < mfl2 :
+        m1[0, :l2[0]] = m2[0, :l2[0]]
 
     for j in xrange(i, min(n1, n2+i)):
         # matching l1[j] with l2[j-i]
-        if l1[j] != l2[j-i]: # they must not match
-            return False, None
-
+        if l1[j] != l2[j-i]: # they must match
+            return False, None, None
+ 
     # pre: l1 and l2 agree up to j, j-i
-    if j == n1-1: # check that the remaining of l2 are adjacent
-        if j-i == n2-1:
-            return True, m1
+    if j == n1-1: # End of l1, check if remaining l2 are adjacent
+        if j-i == n2-1: # End of l1 and l2
+
+            if abs( node_d[l1[n1-1]].end - node_d[l2[n2-1]].end ) > dist_r:
+                if node_d[l1[n1-1]].end < node_d[l2[n2-1]].end and fl1 > g1: 
+                    return False, None, None
+                if node_d[l1[n1-1]].end > node_d[l2[n2-1]].end and fl2 > g2:
+                    return False, None, None
+
+            if   fsm1 != None:
+                return True, m1, fsm1
+            elif fsm2 != None:
+                return True, m1, fsm2
+            else:
+                return True, m1, None
+
         for k in xrange(j-i+1, n2):
             # case 1: this is the 3' end, check that there are no additional 3' exons
-            if (strand=='+' and node_d[l2[k-1]].end!=node_d[l2[k]].start): return False, None
+            if (strand=='+' and node_d[l2[k-1]].end!=node_d[l2[k]].start): return False, None, None
             # case 2: this is the 5' end, check that there are no additional 5' exons unless allowed
-            if (strand=='-' and not merge5 and node_d[l2[k-1]].end!=node_d[l2[k]].start): return False, None
-        m1[0, l2[j-i+1]:] = m1[0, l2[j-i+1]:] + m2[0, l2[j-i+1]:]
-        return True, m1
-    elif j-i == n2-1:
+            if (strand=='-' and node_d[l2[k-1]].end!=node_d[l2[k]].start):
+                if not merge5 or fl1 > g1:
+                    return False, None, None
+
+        if abs( node_d[l1[n1-1]].end - node_d[l2[n2-1]].end ) > dist_r:
+            if node_d[l1[n1-1]].end < node_d[l2[n2-1]].end and fl1 > g1: 
+                return False, None, None
+            if node_d[l1[n1-1]].end > node_d[l2[n2-1]].end and fl2 > g2:
+                return False, None, None
+
+        if strand == '+' or ( strand == '-' and mfl1 <= mfl2 ):
+            m1[0, l2[j-i+1]:] = m2[0, l2[j-i+1]:]
+
+        if   fsm1 != None:
+            return True, m1, fsm1
+        elif fsm2 != None:
+            return True, m1, fsm2
+        else:
+            return True, m1, None
+
+    elif j-i == n2-1: # End of l2, l1 has remaining
         for k in xrange(j+1, n1):
             # case 1, but for m1
-            if (strand=='+' and node_d[l1[k-1]].end!=node_d[l1[k]].start): return False, None
+            if (strand=='+' and node_d[l1[k-1]].end!=node_d[l1[k]].start): return False, None, None
             # case 2, but for m1
-            if (strand=='-' and not merge5 and node_d[l1[k-1]].end!=node_d[l1[k]].start): return False, None
-        return True, m1
+            if (strand=='-' and node_d[l1[k-1]].end!=node_d[l1[k]].start):
+                if not merge5 or fl2 > g2:
+                    return False, None, None
+
+        if abs( node_d[l1[n1-1]].end - node_d[l2[n2-1]].end ) > dist_r:
+            if node_d[l1[n1-1]].end < node_d[l2[n2-1]].end and fl1 > g1: 
+                return False, None, None
+            if node_d[l1[n1-1]].end > node_d[l2[n2-1]].end and fl2 > g2:
+                return False, None, None
+
+        if strand == '-' and mfl1 < mfl2 :
+            m1[0, l2[j-i]+1:] = m2[0, l2[j-i]+1:]
+
+        if   fsm1 != None:
+            return True, m1, fsm1
+        elif fsm2 != None:
+            return True, m1, fsm2
+        else:
+            return True, m1, None
 
     raise Exception, "Should not happen"
 
