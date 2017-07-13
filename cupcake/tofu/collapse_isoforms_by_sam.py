@@ -184,17 +184,23 @@ def main(args):
         print >> sys.stderr, "SAM file {0} does not exist. Abort.".format(args.sam)
         sys.exit(-1)
 
-    if not os.path.exists( args.sqanti ):
-        print >> sys.stderr, "SQANTI report file {0} does not exist. Abort.".format( args.sqanti )
-        sys.exit(-1)
+    if args.sqanti is not None:
+        if not os.path.exists( args.sqanti ):
+            print >> sys.stderr, "SQANTI report file {0} does not exist. Abort.".format( args.sqanti )
+            sys.exit(-1)
 
     # Load FSM info from SQANTI report
     fsm_maps = defaultdict(lambda: None)
-    for line in open( args.sqanti ):
-        columns = line.split()
-        
-        if ( columns[5] == "full-splice_match" ):
-            fsm_maps[columns[0]] = columns[7]
+
+    # If file is not provided then fsm_maps dictionary is empty and all key acceses create {... key: None, ...} elements.
+    if args.sqanti is not None:
+        for line in open( args.sqanti ):
+            columns = line.split()
+            
+            if ( columns[5] == "full-splice_match" ):
+                fsm_maps[columns[0]] = columns[7]
+    else:
+        print("No SQANTI report with cluster FSM provided")
 
     # check for duplicate IDs
     check_ids_unique(args.input, is_fq=args.fq)
@@ -256,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument("--input", help="Input FA/FQ filename")
     parser.add_argument("--fq", default=False, action="store_true", help="Input is a fastq file (default is fasta)")
     parser.add_argument("-s", "--sam", required=True, help="Sorted GMAP SAM filename")
-    parser.add_argument("--sqanti", required=True, help="SQANTI report file")
+    parser.add_argument("--sqanti", help="SQANTI report file")
     parser.add_argument("-o", "--prefix", required=True, help="Output filename prefix")
     parser.add_argument("-c", "--min-coverage", dest="min_aln_coverage", type=float, default=.99, help="Minimum alignment coverage (default: 0.99)")
     parser.add_argument("-i", "--min-identity", dest="min_aln_identity", type=float, default=.95, help="Minimum alignment identity (default: 0.95)")
